@@ -1,57 +1,77 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import os
-import socket
-import time
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from copy import copy
-from typing import Any, cast
+from typing import Any, Optional, Union
 
 import numpy as np
-import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.utils import _validate_truncation_size
+from vllm.envs import VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 from vllm.inputs import PromptType
+from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.outputs import PoolingRequestOutput, RequestOutput
-from vllm.plugins.io_processors import get_io_processor
+from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
-from vllm.tasks import SupportedTask
-from vllm.tracing import init_tracer
-from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
-from vllm.transformers_utils.tokenizer import AnyTokenizer, init_tokenizer_from_configs
+from vllm.transformers_utils.config import (
+    maybe_register_config_serialize_by_value)
+from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils.async_utils import cancel_task_threadsafe
-from vllm.utils.collection_utils import as_list
-from vllm.utils.func_utils import deprecate_kwargs
-from vllm.utils.math_utils import cdiv
+from vllm.utils import Device, cdiv
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.engine.core_client import AsyncMPClient, DPAsyncMPClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
-from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
+from vllm.v1.engine.output_processor import (OutputProcessor,
+                                             RequestOutputCollector)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.processor import Processor
-from vllm.v1.executor import Executor
-from vllm.v1.metrics.loggers import (
-    StatLoggerFactory,
-    StatLoggerManager,
-    load_stat_logger_plugin_factories,
-)
-from vllm.v1.metrics.prometheus import shutdown_prometheus
-from vllm.v1.metrics.stats import IterationStats
-
+from vllm.v1.executor.abstract import Executor
+from vllm.v1.metrics.loggers import (StatLoggerBase, StatLoggerFactory,
+                                     setup_default_loggers)
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
+from contextlib import contextmanager
 logger = init_logger(__name__)
 
 
+import asyncio
+import re
+import numpy as np
+from typing import Optional, List, Dict, Any
+from uuid import uuid4
+from vllm.v1.engine.probe_features_vllm import (
+    compute_probe_slot_from_vllm_steps,
+    SeqFeatureTracker, cum_top_onehot
+)
+
+import inspect, time
+from uuid import uuid4
+
+
+
+import re, time, inspect
+import numpy as np
+from typing import Optional, Dict, Any, List
+from uuid import uuid4
+
+from vllm.v1.engine.probe_features_vllm import (
+    compute_probe_slot_from_vllm_steps,
+    SeqFeatureTracker,
+    cum_top_onehot,
+    compute_openqa_slot_from_vllm_steps,   # NEW
+    OpenSeqFeatureTracker,                 # NEW
+)
+from vllm.sampling_params import SamplingParams
+
 class AsyncLLM(EngineClient):
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -62,11 +82,7 @@ class AsyncLLM(EngineClient):
         use_cached_outputs: bool = False,
         log_requests: bool = True,
         start_engine_loop: bool = True,
-        stat_loggers: list[StatLoggerFactory] | None = None,
-        aggregate_engine_logging: bool = False,
-        client_addresses: dict[str, str] | None = None,
-        client_count: int = 1,
-        client_index: int = 0,
+        stat_loggers: Optional[list[StatLoggerFactory]] = None,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -88,71 +104,60 @@ class AsyncLLM(EngineClient):
         Returns:
             None
         """
+        if not envs.VLLM_USE_V1:
+            raise ValueError(
+                "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False. "
+                "This should not happen. As a workaround, try using "
+                "AsyncLLMEngine.from_vllm_config(...) or explicitly set "
+                "VLLM_USE_V1=0 or 1 and report this issue on Github.")
+
         # Ensure we can serialize custom transformer configs
         maybe_register_config_serialize_by_value()
 
         self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config
-        self.observability_config = vllm_config.observability_config
         self.log_requests = log_requests
+        self.log_stats = log_stats
 
-        custom_stat_loggers = list(stat_loggers or [])
-        custom_stat_loggers.extend(load_stat_logger_plugin_factories())
+        # Set up stat loggers; independent set for each DP rank.
+        self.stat_loggers: list[list[StatLoggerBase]] = setup_default_loggers(
+            vllm_config=vllm_config,
+            log_stats=self.log_stats,
+            engine_num=vllm_config.parallel_config.data_parallel_size,
+            custom_stat_loggers=stat_loggers,
+        )
 
-        has_custom_loggers = bool(custom_stat_loggers)
-        self.log_stats = log_stats or has_custom_loggers
-        if not log_stats and has_custom_loggers:
-            logger.info(
-                "AsyncLLM created with log_stats=False, "
-                "but custom stat loggers were found; "
-                "enabling logging without default stat loggers."
-            )
+        # Tokenizer (+ ensure liveness if running in another process).
+        self.tokenizer = init_tokenizer_from_configs(
+            model_config=vllm_config.model_config,
+            scheduler_config=vllm_config.scheduler_config,
+            lora_config=vllm_config.lora_config)
 
-        if self.model_config.skip_tokenizer_init:
-            tokenizer = None
-        else:
-            tokenizer = init_tokenizer_from_configs(self.model_config)
-
-        self.processor = Processor(self.vllm_config, tokenizer)
-        self.io_processor = get_io_processor(
-            self.vllm_config,
-            self.model_config.io_processor_plugin,
+        # Processor (converts Inputs --> EngineCoreRequests).
+        self.processor = Processor(
+            vllm_config=vllm_config,
+            tokenizer=self.tokenizer,
+            mm_registry=mm_registry,
         )
 
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
-        stream_interval = self.vllm_config.scheduler_config.stream_interval
-        self.output_processor = OutputProcessor(
-            self.tokenizer, log_stats=self.log_stats, stream_interval=stream_interval
-        )
-        endpoint = self.observability_config.otlp_traces_endpoint
-        if endpoint is not None:
-            tracer = init_tracer("vllm.llm_engine", endpoint)
-            self.output_processor.tracer = tracer
+        self.output_processor = OutputProcessor(self.tokenizer,
+                                                log_stats=self.log_stats)
 
         # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
+        core_client_class = AsyncMPClient if (
+            vllm_config.parallel_config.data_parallel_size
+            == 1) else DPAsyncMPClient
+
+        self.engine_core = core_client_class(
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
-            client_addresses=client_addresses,
-            client_count=client_count,
-            client_index=client_index,
         )
-
-        # Loggers.
-        self.logger_manager: StatLoggerManager | None = None
-        if self.log_stats:
-            self.logger_manager = StatLoggerManager(
-                vllm_config=vllm_config,
-                engine_idxs=self.engine_core.engine_ranks_managed,
-                custom_stat_loggers=custom_stat_loggers,
-                enable_default_loggers=log_stats,
-                client_count=client_count,
-                aggregate_engine_logging=aggregate_engine_logging,
-            )
-            self.logger_manager.log_engine_initialized()
-
-        self.output_handler: asyncio.Task | None = None
+        if self.stat_loggers:
+            for stat_logger in self.stat_loggers[0]:
+                stat_logger.log_engine_initialized()
+        self.output_handler: Optional[asyncio.Task] = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -160,58 +165,32 @@ class AsyncLLM(EngineClient):
         except RuntimeError:
             pass
 
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            logger.info(
-                "Torch profiler enabled. AsyncLLM CPU traces will be collected under %s",  # noqa: E501
-                envs.VLLM_TORCH_PROFILER_DIR,
-            )
-            worker_name = f"{socket.gethostname()}_{os.getpid()}.async_llm"
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                ],
-                with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    envs.VLLM_TORCH_PROFILER_DIR, worker_name=worker_name, use_gzip=True
-                ),
-            )
-        else:
-            self.profiler = None
-
     @classmethod
-    @deprecate_kwargs(
-        "disable_log_requests",
-        additional_message=(
-            "This argument will have no effect. Use `enable_log_requests` instead."
-        ),
-    )
     def from_vllm_config(
         cls,
         vllm_config: VllmConfig,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        stat_loggers: list[StatLoggerFactory] | None = None,
-        enable_log_requests: bool = False,
-        aggregate_engine_logging: bool = False,
+        stat_loggers: Optional[list[StatLoggerFactory]] = None,
+        disable_log_requests: bool = False,
         disable_log_stats: bool = False,
-        client_addresses: dict[str, str] | None = None,
-        client_count: int = 1,
-        client_index: int = 0,
-        disable_log_requests: bool = True,  # Deprecated, will be removed
     ) -> "AsyncLLM":
+        if not envs.VLLM_USE_V1:
+            raise ValueError(
+                "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False. "
+                "This should not happen. As a workaround, try using "
+                "AsyncLLMEngine.from_vllm_config(...) or explicitly set "
+                "VLLM_USE_V1=0 or 1 and report this issue on Github.")
+
         # Create the LLMEngine.
         return cls(
             vllm_config=vllm_config,
             executor_class=Executor.get_class(vllm_config),
             start_engine_loop=start_engine_loop,
             stat_loggers=stat_loggers,
-            log_requests=enable_log_requests,
+            log_requests=not disable_log_requests,
             log_stats=not disable_log_stats,
-            aggregate_engine_logging=aggregate_engine_logging,
             usage_context=usage_context,
-            client_addresses=client_addresses,
-            client_count=client_count,
-            client_index=client_index,
         )
 
     @classmethod
@@ -220,7 +199,7 @@ class AsyncLLM(EngineClient):
         engine_args: AsyncEngineArgs,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        stat_loggers: list[StatLoggerFactory] | None = None,
+        stat_loggers: Optional[list[StatLoggerFactory]] = None,
     ) -> "AsyncLLM":
         """Create an AsyncLLM from the EngineArgs."""
 
@@ -232,7 +211,7 @@ class AsyncLLM(EngineClient):
         return cls(
             vllm_config=vllm_config,
             executor_class=executor_class,
-            log_requests=engine_args.enable_log_requests,
+            log_requests=not engine_args.disable_log_requests,
             log_stats=not engine_args.disable_log_stats,
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
@@ -245,97 +224,64 @@ class AsyncLLM(EngineClient):
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC."""
 
-        shutdown_prometheus()
-
         if engine_core := getattr(self, "engine_core", None):
             engine_core.shutdown()
 
-        handler = getattr(self, "output_handler", None)
-        if handler is not None:
-            cancel_task_threadsafe(handler)
-
-    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
-        return await self.engine_core.get_supported_tasks_async()
+        if handler := getattr(self, "output_handler", None):
+            handler.cancel()
 
     async def add_request(
         self,
         request_id: str,
-        prompt: EngineCoreRequest | PromptType,
-        params: SamplingParams | PoolingParams,
-        arrival_time: float | None = None,
-        lora_request: LoRARequest | None = None,
-        tokenization_kwargs: dict[str, Any] | None = None,
-        trace_headers: Mapping[str, str] | None = None,
+        prompt: PromptType,
+        params: Union[SamplingParams, PoolingParams],
+        arrival_time: Optional[float] = None,
+        lora_request: Optional[LoRARequest] = None,
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
-        data_parallel_rank: int | None = None,
-        prompt_text: str | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
         if self.errored:
             raise EngineDeadError()
 
-        is_pooling = isinstance(params, PoolingParams)
+        assert isinstance(params, SamplingParams), \
+            "Pooling is not supported in V1"
 
         # Create a new output collector for the request.
         queue = RequestOutputCollector(output_kind=params.output_kind)
 
         # Convert Input --> Request.
-        if isinstance(prompt, EngineCoreRequest):
-            request = prompt
-        else:
-            assert prompt_text is None
-            logger.warning_once(
-                "Processor has been moved under OpenAIServing and will "
-                "be removed from AsyncLLM in v0.13."
-            )
-            request = self.processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
-            )
-            if isinstance(prompt, str):
-                prompt_text = prompt
-            elif isinstance(prompt, Mapping):
-                prompt_text = cast(str | None, prompt.get("prompt"))
+        prompt_str, request = self.processor.process_inputs(
+            request_id, prompt, params, arrival_time, lora_request,
+            tokenization_kwargs, trace_headers, prompt_adapter_request,
+            priority)
 
-        if is_pooling or params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+        if params.n == 1:
+            await self._add_request(request, prompt_str, None, 0, queue)
             return queue
 
-        # Get the updated SamplingParams from the request, which
-        # were cloned/updated in processor.process_inputs above.
-        parent_params = request.sampling_params
-        assert parent_params is not None
-
         # Fan out child requests (for n>1).
-        parent_request = ParentRequest(request_id, parent_params)
-        for idx in range(parent_params.n):
-            request_id, child_params = parent_request.get_child_info(idx)
-            child_request = request if idx == parent_params.n - 1 else copy(request)
+        parent_request = ParentRequest(request_id, params)
+        for idx in range(params.n):
+            request_id, params = parent_request.get_child_info(idx)
+            child_request = request if idx == params.n - 1 else copy(request)
             child_request.request_id = request_id
-            child_request.sampling_params = child_params
-            await self._add_request(
-                child_request, prompt_text, parent_request, idx, queue
-            )
+            child_request.sampling_params = params
+            await self._add_request(child_request, prompt_str, parent_request,
+                                    idx, queue)
         return queue
 
-    async def _add_request(
-        self,
-        request: EngineCoreRequest,
-        prompt: str | None,
-        parent_req: ParentRequest | None,
-        index: int,
-        queue: RequestOutputCollector,
-    ):
+    async def _add_request(self, request: EngineCoreRequest,
+                           prompt: Optional[str],
+                           parent_req: Optional[ParentRequest], index: int,
+                           queue: RequestOutputCollector):
+
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        self.output_processor.add_request(request, prompt, parent_req, index,
+                                          queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -350,16 +296,14 @@ class AsyncLLM(EngineClient):
     # re-multiplexed in the API server anyhow.
     async def generate(
         self,
-        prompt: EngineCoreRequest | PromptType,
+        prompt: PromptType,
         sampling_params: SamplingParams,
         request_id: str,
-        *,
-        prompt_text: str | None = None,
-        lora_request: LoRARequest | None = None,
-        tokenization_kwargs: dict[str, Any] | None = None,
-        trace_headers: Mapping[str, str] | None = None,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
-        data_parallel_rank: int | None = None,
+        tokenization_kwargs: Optional[dict[str, Any]] = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -376,42 +320,21 @@ class AsyncLLM(EngineClient):
         returning the RequestOutput back to the caller.
         """
 
-        if (
-            self.vllm_config.cache_config.kv_sharing_fast_prefill
-            and sampling_params.prompt_logprobs
-        ):
-            raise ValueError(
-                "--kv-sharing-fast-prefill produces incorrect logprobs for "
-                "prompt tokens, please disable it when the requests need "
-                "prompt logprobs"
-            )
-
         try:
             # We start the output_handler on the first call to generate() so
             # we can call __init__ before the event loop, which enables us
             # to handle startup failure gracefully in the OpenAI server.
             self._run_output_handler()
 
-            if tokenization_kwargs is None:
-                tokenization_kwargs = {}
-                truncate_prompt_tokens = sampling_params.truncate_prompt_tokens
-
-                _validate_truncation_size(
-                    self.model_config.max_model_len,
-                    truncate_prompt_tokens,
-                    tokenization_kwargs,
-                )
-
             q = await self.add_request(
                 request_id,
                 prompt,
                 sampling_params,
                 lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
+                prompt_adapter_request=prompt_adapter_request,
                 priority=priority,
-                data_parallel_rank=data_parallel_rank,
-                prompt_text=prompt_text,
+                tokenization_kwargs=tokenization_kwargs,
             )
 
             # The output_handler task pushes items into the queue.
@@ -425,13 +348,11 @@ class AsyncLLM(EngineClient):
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
                 finished = out.finished
-                assert isinstance(out, RequestOutput)
                 yield out
 
         # If the request is disconnected by the client, generate()
-        # is cancelled or the generator is garbage collected. So,
-        # we abort the request if we end up here.
-        except (asyncio.CancelledError, GeneratorExit):
+        # is cancelled. So, we abort the request if we end up here.
+        except asyncio.CancelledError:
             await self.abort(request_id)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
@@ -467,36 +388,33 @@ class AsyncLLM(EngineClient):
         engine_core = self.engine_core
         output_processor = self.output_processor
         log_stats = self.log_stats
-        logger_manager = self.logger_manager
-        processor = self.processor
+        stat_loggers = self.stat_loggers if log_stats else None
 
         async def output_handler():
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
+                    
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
 
-                    iteration_stats = (
-                        IterationStats() if (log_stats and num_outputs) else None
-                    )
+                    iteration_stats = IterationStats() if (
+                        log_stats and num_outputs) else None
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
                     # event loop for too long.
-                    if num_outputs <= envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE:
-                        slices = (outputs.outputs,)
+                    if num_outputs <= VLLM_V1_OUTPUT_PROC_CHUNK_SIZE:
+                        slices = (outputs.outputs, )
                     else:
                         slices = np.array_split(
                             outputs.outputs,
-                            cdiv(num_outputs, envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE),
-                        )
+                            cdiv(num_outputs, VLLM_V1_OUTPUT_PROC_CHUNK_SIZE))
 
                     for i, outputs_slice in enumerate(slices):
                         # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
-                            outputs_slice, outputs.timestamp, iteration_stats
-                        )
+                            outputs_slice, outputs.timestamp, iteration_stats)
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
 
@@ -506,20 +424,17 @@ class AsyncLLM(EngineClient):
 
                         # 3) Abort any reqs that finished due to stop strings.
                         await engine_core.abort_requests_async(
-                            processed_outputs.reqs_to_abort
-                        )
-
-                    output_processor.update_scheduler_stats(outputs.scheduler_stats)
+                            processed_outputs.reqs_to_abort)
 
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
-                    if logger_manager:
-                        logger_manager.record(
-                            engine_idx=outputs.engine_index,
+                    if stat_loggers:
+                        assert outputs.scheduler_stats is not None
+                        AsyncLLM._record_stats(
+                            stat_loggers[outputs.engine_index],
                             scheduler_stats=outputs.scheduler_stats,
                             iteration_stats=iteration_stats,
-                            mm_cache_stats=processor.stat_mm_cache(),
                         )
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
@@ -527,166 +442,93 @@ class AsyncLLM(EngineClient):
 
         self.output_handler = asyncio.create_task(output_handler())
 
-    async def abort(self, request_id: str | Iterable[str]) -> None:
+    async def abort(self, request_id: str) -> None:
         """Abort RequestId in OutputProcessor and EngineCore."""
 
-        request_ids = (
-            (request_id,) if isinstance(request_id, str) else as_list(request_id)
-        )
-        all_request_ids = self.output_processor.abort_requests(request_ids)
-        await self.engine_core.abort_requests_async(all_request_ids)
+        request_ids = self.output_processor.abort_requests((request_id, ))
+        await self.engine_core.abort_requests_async(request_ids)
 
         if self.log_requests:
-            logger.info("Aborted request(s) %s.", ",".join(request_ids))
+            logger.info("Aborted request %s.", request_id)
 
-    async def encode(
+    @staticmethod
+    def _record_stats(
+        stat_loggers: list[StatLoggerBase],
+        scheduler_stats: SchedulerStats,
+        iteration_stats: Optional[IterationStats],
+    ):
+        """static so that it can be used from the output_handler task
+        without a circular ref to AsyncLLM."""
+        for stat_logger in stat_loggers:
+            stat_logger.record(scheduler_stats=scheduler_stats,
+                               iteration_stats=iteration_stats)
+
+    def encode(
         self,
         prompt: PromptType,
         pooling_params: PoolingParams,
         request_id: str,
-        lora_request: LoRARequest | None = None,
-        trace_headers: Mapping[str, str] | None = None,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
-        truncate_prompt_tokens: int | None = None,
-        tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> AsyncGenerator[PoolingRequestOutput, None]:
-        """
-        Main function called by the API server to kick off a request
-            * 1) Making an AsyncStream corresponding to the Request.
-            * 2) Processing the Input.
-            * 3) Adding the Request to the EngineCore (separate process).
+    ):
+        raise ValueError("Not Supported on V1 yet.")
 
-        A separate output_handler loop runs in a background AsyncIO task,
-        pulling outputs from EngineCore and putting them into the
-        per-request AsyncStream.
+    async def get_vllm_config(self) -> VllmConfig:
+        return self.vllm_config
 
-        The caller of generate() iterates the returned AsyncGenerator,
-        returning the RequestOutput back to the caller.
-        """
+    async def get_model_config(self) -> ModelConfig:
+        return self.model_config
 
-        try:
-            # We start the output_handler on the first call to generate() so
-            # we can call __init__ before the event loop, which enables us
-            # to handle startup failure gracefully in the OpenAI server.
-            self._run_output_handler()
+    async def get_decoding_config(self):
+        raise ValueError("Not Supported on V1 yet.")
 
-            if tokenization_kwargs is None:
-                tokenization_kwargs = {}
-            _validate_truncation_size(
-                self.model_config.max_model_len,
-                truncate_prompt_tokens,
-                tokenization_kwargs,
-            )
+    async def get_input_preprocessor(self) -> InputPreprocessor:
+        return self.processor.input_preprocessor
 
-            q = await self.add_request(
-                request_id,
-                prompt,
-                pooling_params,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-            )
-
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
-            finished = False
-            while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
-                out = q.get_nowait() or await q.get()
-                assert isinstance(out, PoolingRequestOutput)
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
-                finished = out.finished
-                yield out
-
-        # If the request is disconnected by the client, generate()
-        # is cancelled. So, we abort the request if we end up here.
-        except asyncio.CancelledError:
-            await self.abort(request_id)
-            if self.log_requests:
-                logger.info("Request %s aborted.", request_id)
-            raise
-
-        # Engine is dead. Do not abort since we shut down.
-        except EngineDeadError:
-            if self.log_requests:
-                logger.info("Request %s failed (engine dead).", request_id)
-            raise
-
-        # Request validation error.
-        except ValueError:
-            if self.log_requests:
-                logger.info("Request %s failed (bad request).", request_id)
-            raise
-
-        # Unexpected error in the generate() task (possibly recoverable).
-        except Exception as e:
-            await self.abort(request_id)
-            if self.log_requests:
-                logger.info("Request %s failed.", request_id)
-            raise EngineGenerateError() from e
-
-    @property
-    def tokenizer(self) -> AnyTokenizer | None:
-        return self.processor.tokenizer
-
-    @tokenizer.setter
-    def tokenizer(self, tokenizer: AnyTokenizer | None) -> None:
-        self.processor.tokenizer = tokenizer
-
-    async def get_tokenizer(self) -> AnyTokenizer:
-        if self.tokenizer is None:
-            raise ValueError(
-                "Unable to get tokenizer because skip_tokenizer_init is True"
-            )
-
-        return self.tokenizer
+    async def get_tokenizer(
+        self,
+        lora_request: Optional[LoRARequest] = None,
+    ) -> AnyTokenizer:
+        return self.tokenizer.get_lora_tokenizer(lora_request)
 
     async def is_tracing_enabled(self) -> bool:
-        return self.observability_config.otlp_traces_endpoint is not None  # type: ignore
+        return False
 
-    async def do_log_stats(self) -> None:
-        if self.logger_manager:
-            self.logger_manager.log()
+    async def do_log_stats(
+        self,
+        scheduler_outputs=None,
+        model_output=None,
+    ) -> None:
+        for loggers in self.stat_loggers:
+            for stat_logger in loggers:
+                stat_logger.log()
 
     async def check_health(self) -> None:
         logger.debug("Called check_health.")
-        if self.errored:
-            raise self.dead_error
 
     async def start_profile(self) -> None:
-        coros = [self.engine_core.profile_async(True)]
-        if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.start))
-        await asyncio.gather(*coros)
+        await self.engine_core.profile_async(True)
 
     async def stop_profile(self) -> None:
-        coros = [self.engine_core.profile_async(False)]
-        if self.profiler is not None:
-            coros.append(asyncio.to_thread(self.profiler.stop))
-        await asyncio.gather(*coros)
+        await self.engine_core.profile_async(False)
 
     async def reset_mm_cache(self) -> None:
-        self.processor.clear_mm_cache()
+        self.processor.mm_registry.reset_processor_cache()
+        self.processor.mm_input_cache_client.reset()
         await self.engine_core.reset_mm_cache_async()
 
-    async def reset_prefix_cache(self) -> None:
+    async def reset_prefix_cache(self,
+                                 device: Optional[Device] = None) -> None:
+        if device == Device.CPU:
+            raise ValueError("Not supported on CPU.")
         await self.engine_core.reset_prefix_cache_async()
 
     async def sleep(self, level: int = 1) -> None:
-        await self.reset_prefix_cache()
         await self.engine_core.sleep_async(level)
 
-        if self.logger_manager is not None:
-            self.logger_manager.record_sleep_state(1, level)
-
-    async def wake_up(self, tags: list[str] | None = None) -> None:
+    async def wake_up(self, tags: Optional[list[str]] = None) -> None:
         await self.engine_core.wake_up_async(tags)
-
-        if self.logger_manager is not None:
-            self.logger_manager.record_sleep_state(0, 0)
 
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
@@ -707,77 +549,16 @@ class AsyncLLM(EngineClient):
         """Prevent an adapter from being evicted."""
         return await self.engine_core.pin_lora_async(lora_id)
 
-    async def collective_rpc(
-        self,
-        method: str,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict | None = None,
-    ):
+    async def collective_rpc(self,
+                             method: str,
+                             timeout: Optional[float] = None,
+                             args: tuple = (),
+                             kwargs: Optional[dict] = None):
         """
         Perform a collective RPC call to the given path.
         """
         return await self.engine_core.collective_rpc_async(
-            method, timeout, args, kwargs
-        )
-
-    async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
-        """Wait for all requests to be drained."""
-        start_time = time.time()
-        while time.time() - start_time < drain_timeout:
-            if not self.engine_core.dp_engines_running():
-                logger.info("Engines are idle, requests have been drained")
-                return
-
-            logger.info("Engines are still running, waiting for requests to drain...")
-            await asyncio.sleep(1)  # Wait 1 second before checking again
-
-        raise TimeoutError(
-            f"Timeout reached after {drain_timeout} seconds "
-            "waiting for requests to drain."
-        )
-
-    async def scale_elastic_ep(
-        self, new_data_parallel_size: int, drain_timeout: int = 300
-    ):
-        """
-        Scale up or down the data parallel size by adding or removing
-        engine cores.
-        Args:
-            new_data_parallel_size: The new number of data parallel workers
-            drain_timeout:
-                Maximum time to wait for requests to drain (seconds)
-        """
-        old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
-        if old_data_parallel_size == new_data_parallel_size:
-            logger.info(
-                "Data parallel size is already %s, skipping scale",
-                new_data_parallel_size,
-            )
-            return
-        logger.info(
-            "Waiting for requests to drain before scaling up to %s engines...",
-            new_data_parallel_size,
-        )
-        await self.wait_for_requests_to_drain(drain_timeout)
-        logger.info(
-            "Requests have been drained, proceeding with scale to %s engines",
-            new_data_parallel_size,
-        )
-        await self.engine_core.scale_elastic_ep(new_data_parallel_size)
-        self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-
-        # recreate stat loggers
-        if new_data_parallel_size > old_data_parallel_size and self.log_stats:
-            # TODO(rob): fix this after talking with Ray team.
-            # This resets all the prometheus metrics since we
-            # unregister during initialization. Need to understand
-            # the intended behavior here better.
-            self.logger_manager = StatLoggerManager(
-                vllm_config=self.vllm_config,
-                engine_idxs=list(range(new_data_parallel_size)),
-                custom_stat_loggers=None,
-            )
+            method, timeout, args, kwargs)
 
     @property
     def is_running(self) -> bool:
@@ -795,3 +576,693 @@ class AsyncLLM(EngineClient):
     @property
     def dead_error(self) -> BaseException:
         return EngineDeadError()
+
+    def _lp_step_to_pairs(self, step_obj) -> list[tuple[str, float]]:
+        """
+        把 vLLM 的“一步 top-logprobs”统一转成 [(decoded_token, logprob), ...]（按 rank 升序）。
+        支持两种形态：
+          - dict 形态: {token_id: Logprob(...)}
+          - list 形态: [Logprob(...), ...]
+        """
+        pairs: list[tuple[str, float]] = []
+        try:
+            if hasattr(step_obj, "items"):
+                items = list(step_obj.items())
+                items.sort(key=lambda kv: getattr(kv[1], "rank", 10**9))
+                for _, obj in items:
+                    txt = (getattr(obj, "decoded_token", "") or "").strip()
+                    lp = float(getattr(obj, "logprob", float("-inf")))
+                    pairs.append((txt, lp))
+                return pairs
+
+            if isinstance(step_obj, (list, tuple)):
+                items = list(step_obj)
+                items.sort(key=lambda obj: getattr(obj, "rank", 10**9))
+                for obj in items:
+                    txt = (getattr(obj, "decoded_token", "") or "").strip()
+                    lp = float(getattr(obj, "logprob", float("-inf")))
+                    pairs.append((txt, lp))
+                return pairs
+        except Exception:
+            pass
+        return pairs
+
+    # ===========================
+    # 2) 兼容 vLLM finished 属性 / 方法
+    # ===========================
+    def _lp_step_to_pairs(self, step_obj) -> list[tuple[str, float]]:
+        """
+        把 vLLM 的“一步 top-logprobs”统一转成 [(decoded_token, logprob), ...]（按 rank 升序）。
+        支持两种形态：
+          - dict 形态: {token_id: Logprob(...)}
+          - list 形态: [Logprob(...), ...]
+        """
+        pairs: list[tuple[str, float]] = []
+        try:
+            # dict 形态: {token_id: Logprob(...)}
+            if hasattr(step_obj, "items"):
+                items = list(step_obj.items())
+                items.sort(key=lambda kv: getattr(kv[1], "rank", 10**9))
+                for _, obj in items:
+                    txt = (getattr(obj, "decoded_token", "") or "").strip()
+                    lp = float(getattr(obj, "logprob", float("-inf")))
+                    pairs.append((txt, lp))
+                return pairs
+
+            # list/tuple 形态: [Logprob(...), ...]
+            if isinstance(step_obj, (list, tuple)):
+                items = list(step_obj)
+                items.sort(key=lambda obj: getattr(obj, "rank", 10**9))
+                for obj in items:
+                    txt = (getattr(obj, "decoded_token", "") or "").strip()
+                    lp = float(getattr(obj, "logprob", float("-inf")))
+                    pairs.append((txt, lp))
+                return pairs
+        except Exception:
+            pass
+        return pairs
+
+    # ===========================
+    # 2) 兼容 vLLM finished 属性 / 方法
+    # ===========================
+    def _is_finished_output(self, o) -> tuple[bool, Optional[str]]:
+        """
+        vLLM 有的版本是 o.finished (bool)，有的是 o.finished() (方法)。
+        这里统一成 (is_finished: bool, reason: Optional[str])。
+        """
+        fin_attr = getattr(o, "finished", False)
+        if callable(fin_attr):
+            try:
+                is_finished = bool(fin_attr())
+            except TypeError:
+                # 万一签名有变，就退回当成属性用
+                is_finished = bool(fin_attr)
+        else:
+            is_finished = bool(fin_attr)
+
+        reason = getattr(o, "finish_reason", None)
+        if reason is None:
+            # 有的版本只写在 stop_reason 上
+            reason = getattr(o, "stop_reason", None)
+
+        return is_finished, reason
+
+    # ===========================
+    # 3) 一次性短请求（probe 内部复用）
+    # ===========================
+    async def _run_once(
+        self,
+        *,
+        prompt: str,
+        sampling_params: SamplingParams,
+        request_id: Optional[str] = None,
+        stop_on_first_finish: bool = True,
+        tokenization_kwargs: Optional[dict] = None,
+    ) -> dict:
+        """
+        以一次性短请求的形式跑到 max_tokens 或 stop 条件，然后返回最终文本与 logprobs。
+
+        额外返回：
+          - num_generated_tokens：本段实际生成的 token 数
+          - finish_reason：模型的终止原因（如 "stop" / "length" / None）
+        """
+        rid = request_id or f"once-{uuid4().hex[:8]}"
+        text_total = ""
+        steps_logprobs = []
+        finished = False
+        num_generated_tokens = 0
+        finish_reason = None
+
+        async for out in self.generate(
+            prompt,
+            sampling_params,
+            request_id=rid,
+            tokenization_kwargs=tokenization_kwargs,
+        ):
+            o = out.outputs[0]
+
+            if o.text:
+                # vLLM 流是累计文本
+                text_total = o.text
+            if o.logprobs:
+                # 同理是累计步；最后统一取整段
+                steps_logprobs = o.logprobs
+
+            if o.token_ids is not None:
+                num_generated_tokens = len(o.token_ids)
+
+            is_finished, fin_reason = self._is_finished_output(o)
+            if is_finished:
+                finished = True
+                finish_reason = fin_reason
+                if stop_on_first_finish:
+                    break
+
+        return {
+            "text": text_total,
+            "steps_logprobs": steps_logprobs,
+            "finished": finished,
+            "num_generated_tokens": int(num_generated_tokens),
+            "finish_reason": finish_reason,
+        }
+
+    # ===========================
+    # 4) 正则 & openQA boxed 抽取（MATH 用 brace-balanced 方式）
+    # ===========================
+    _FA_BLOCK = re.compile(
+        r"<\s*final_answer\s*>(.*?)<\s*/\s*final_answer\s*>",
+        flags=re.I | re.S,
+    )
+    _FA_OPEN = re.compile(r"<\s*final_answer\b", flags=re.I)
+    _FA_CLOSE = re.compile(r"</\s*final_answer\s*>", flags=re.I)
+    _THINK_CLOSE = re.compile(r"</\s*think\s*>", flags=re.I)
+
+    _BOXED_RE = re.compile(r"\\boxed\s*\{\s*(.*?)\s*\}", flags=re.S)
+
+    # ---- brace-balanced 版 boxed 提取（复刻你 offline 的逻辑）----
+    def _last_boxed_only_string(self, string: str) -> Optional[str]:
+        """返回最后一个 \\boxed{...} 或 \\fbox{...}（包含外层大括号），用 brace 计数避免截断 \\frac 之类。"""
+        if not isinstance(string, str):
+            return None
+        idx = string.rfind("\\boxed")
+        if idx < 0:
+            idx = string.rfind("\\fbox")
+            if idx < 0:
+                return None
+        i = idx
+        right_brace_idx = None
+        num_left_braces_open = 0
+        while i < len(string):
+            ch = string[i]
+            if ch == "{":
+                num_left_braces_open += 1
+            if ch == "}":
+                num_left_braces_open -= 1
+                if num_left_braces_open == 0:
+                    right_brace_idx = i
+                    break
+            i += 1
+        if right_brace_idx is None:
+            return None
+        return string[idx:right_brace_idx + 1]
+
+    def _remove_boxed_braces(self, s: str) -> Optional[str]:
+        """从 '\\boxed{...}' 或 '\\fbox{...}' 中去掉外层大括号，只保留内部内容。"""
+        try:
+            if not isinstance(s, str):
+                return None
+            if s.startswith("\\boxed{"):
+                return s[len("\\boxed{"):-1]
+            if s.startswith("\\fbox{"):
+                return s[len("\\fbox{"):-1]
+            return None
+        except Exception:
+            return None
+
+    def _extract_answer_key(self, text: str) -> str:
+        """
+        openQA / MATH 场景下用于构造 answer_key：
+        - 优先用 brace-balanced 的方式，从最后一个 \\boxed{...} / \\fbox{...} 中抽内部；
+        - 若失败，再退回简单正则 / <final_answer>；
+        - 最后兜底返回整段 strip。
+        """
+        if not isinstance(text, str):
+            return ""
+
+        # 1) 优先：brace-balanced 查找最后一个 \boxed / \fbox
+        chunk = self._last_boxed_only_string(text)
+        if chunk is not None:
+            inner = self._remove_boxed_braces(chunk)
+            if inner is not None:
+                return inner.strip()
+
+        # 2) 次优：简单正则（不保证嵌套严格正确）
+        all_boxes = self._BOXED_RE.findall(text)
+        if all_boxes:
+            return all_boxes[-1].strip()
+
+        # 3) 再退：<final_answer>...</final_answer> 内部，如有，再看内部是否有 \boxed
+        mfa = self._FA_BLOCK.search(text)
+        if mfa:
+            inner = mfa.group(1).strip()
+            inner_boxes = self._BOXED_RE.findall(inner)
+            if inner_boxes:
+                return inner_boxes[-1].strip()
+            return inner
+
+        # 4) 兜底
+        return text.strip()
+
+    # ===========================
+    # 5) probe 一次（区分 closeqa / openqa）
+    # ===========================
+    async def _probe_once(
+        self,
+        *,
+        base_prompt: str,
+        think_accum: str,
+        suffix: str,
+        probe_max_steps: int,
+        topk: int,
+        qa_mode: str,
+    ) -> dict:
+        """
+        串行探针： base_prompt + think_accum + suffix （closeQA）或固定 openQA 模板。
+        不与主解码并发，不共享同一条长流；依赖全局 enable_prefix_caching=True 自动命中 KV 前缀。
+        返回 steps_logprobs 已转换为 list[list[(decoded_token, logprob)]]。
+        """
+        qa_mode = (qa_mode or "closeqa").lower()
+        if qa_mode == "openqa":
+            # openQA：忽略传入 suffix，统一固定为 "</think> \\boxed{"，
+            # 不再用 "}" 作为 stop，只用 max_tokens/EOS 控制长度。
+            probe_prompt = f"{base_prompt}{think_accum} </think> \\boxed{{"
+            stop_seqs: List[str] = []
+        else:
+            # closeQA：保持原有 suffix + </final_answer> 停
+            probe_prompt = f"{base_prompt}{think_accum}{suffix}"
+            stop_seqs = ["</final_answer>"]
+
+        sp = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=int(probe_max_steps),
+            logprobs=int(topk),
+            stop=stop_seqs,
+        )
+
+        res = await self._run_once(
+            prompt=probe_prompt,
+            sampling_params=sp,
+            stop_on_first_finish=True,
+            tokenization_kwargs=None,
+        )
+
+        raw_steps = res.get("steps_logprobs") or []
+        steps_pairs: list[list[tuple[str, float]]] = []
+        for step in raw_steps:
+            p = self._lp_step_to_pairs(step)
+            if p:
+                steps_pairs.append(p)
+
+        return {
+            "steps_logprobs": steps_pairs,
+            "probe_text": res.get("text") or "",
+        }
+
+    # ===========================
+    # 6) SamplingParams 辅助
+    # ===========================
+    def _sp_from_like(self, sp_like):
+        if isinstance(sp_like, SamplingParams):
+            return sp_like
+        if isinstance(sp_like, dict):
+            return SamplingParams(**sp_like)
+        try:
+            return SamplingParams(**dict(sp_like))
+        except Exception:
+            pass
+        raise TypeError(
+            f"sampling_params must be dict or SamplingParams, got {type(sp_like)}"
+        )
+
+    # ===========================
+    # 7) 主函数：generate_with_checks
+    # ===========================
+    async def generate_with_checks(
+        self,
+        *,
+        prompt: str,  # 包含 <system> + user + assistant<think> 开场
+        sampling_params_main,  # dict / SamplingParams
+        probe_max_steps: int = 4,
+        check_interval: int = 50,
+        topk: int = 8,
+        classifier_callable=None,  # (feats_dict)->(prob, letter_hint)
+        threshold: float = 0.95,
+        request_id: Optional[str] = None,
+        enable_early_stop: bool = True,
+        qa_mode: str = "closeqa",
+    ) -> dict:
+        """
+        单流版本（只有一条主流）+ 间隔 probe + 可选早停。
+
+        closeQA:
+          - 可以用 <final_answer>...</final_answer> 做硬停；
+          - probe 特征用于 ABCD bucket + classifier 早停。
+
+        openQA (MATH):
+          - 完全不依赖 <final_answer>，只看 \boxed{...}；
+          - probe 时 prompt 固定到 "</think> \\boxed{"，特征从 boxed 轨迹里提；
+          - 早停时直接返回标准形式 "\\boxed{...}"。
+        """
+        qa_mode = (qa_mode or "closeqa").lower()
+        if qa_mode not in ("closeqa", "openqa"):
+            raise ValueError(
+                f"qa_mode must be 'closeqa' or 'openqa', got {qa_mode!r}"
+            )
+
+        if enable_early_stop and classifier_callable is None:
+            raise ValueError(
+                "enable_early_stop=True 但未提供 classifier_callable；"
+                "如果不想使用分类器早停，请将 enable_early_stop 设为 False。"
+            )
+
+        use_classifier_for_logging = classifier_callable is not None
+        use_classifier_for_early_stop = (
+            enable_early_stop and classifier_callable is not None
+        )
+
+        sp_main = self._sp_from_like(sampling_params_main)
+        # 主流不取 logprobs，避免巨量 Python 列表化拷贝
+        try:
+            sp_main.logprobs = None
+        except Exception:
+            pass
+        # 给主流一个安全上限（由外部决定最大生成量）
+        if not getattr(sp_main, "max_tokens", None):
+            sp_main.max_tokens = 4096
+
+        # Tracker：closeQA / openQA 不同
+        if qa_mode == "closeqa":
+            tracker: Any = SeqFeatureTracker(W=5, K_recent=3)
+        else:
+            tracker = OpenSeqFeatureTracker(W=5, K_recent=3)
+
+        # 用来收集所有 probe 的中间信息
+        probe_records: list[dict[str, Any]] = []
+        last_probe_prob: float = 0.0
+
+        # ===== Round-0 baseline probe（空 think）=====
+        base_probe = await self._probe_once(
+            base_prompt=prompt,
+            think_accum="",
+            suffix=" </think> <final_answer>",
+            probe_max_steps=probe_max_steps,
+            topk=topk,
+            qa_mode=qa_mode,
+        )
+
+        if qa_mode == "closeqa":
+            # 选择题：ABCD 桶聚合
+            slot0 = compute_probe_slot_from_vllm_steps(
+                steps_logprobs=base_probe["steps_logprobs"],
+                topk=int(topk),
+                prefer_letter=None,
+                probe_text=base_probe["probe_text"] or "",
+            )
+            feats0 = tracker.update_with_step_vals(slot0["vals"])
+            feats0.update(cum_top_onehot(feats0.get("cum_top")))
+            answer_key0 = None
+        else:
+            # openQA / math：用 1D L_sum + 轨迹特征，
+            # answer_key 从“fake boxed”中提取
+            slot0 = compute_openqa_slot_from_vllm_steps(
+                steps_logprobs=base_probe["steps_logprobs"],
+                topk=int(topk),
+            )
+            probe_text0 = base_probe["probe_text"] or ""
+            fake_box0 = f"\\boxed{{{probe_text0}}}"
+            answer_key0 = self._extract_answer_key(fake_box0)
+            feats0 = tracker.update_with_slot(slot0, answer_key=answer_key0)
+
+        if use_classifier_for_logging:
+            prob0, letter0 = classifier_callable(feats0)
+        else:
+            prob0, letter0 = None, None
+
+        if isinstance(prob0, (int, float)):
+            last_probe_prob = float(prob0)
+        else:
+            last_probe_prob = 0.0
+
+        probe_records.append(
+            {
+                "step": 0,
+                "kind": "baseline",
+                "probe_text": base_probe["probe_text"],
+                "steps_logprobs": base_probe["steps_logprobs"],
+                "slot": slot0,
+                "feats": feats0,
+                "classifier_prob": float(prob0) if prob0 is not None else None,
+                "classifier_letter": letter0,
+                "early_stop_triggered": False,
+                "qa_mode": qa_mode,
+            }
+        )
+
+        # ========= 单条主生成流 =========
+        main_rid = request_id or f"main-{uuid4().hex[:8]}"""
+        agen = self.generate(prompt, sp_main, request_id=main_rid)
+
+        think_accum = ""
+        seen_close = False       # </think> 是否出现过
+        seen_final_open = False  # <final_answer> 是否出现过（仅 closeQA 有意义）
+        total_tokens = 0
+        last_probe_at = 0
+        finished = False
+
+        try:
+            async for out in agen:
+                o = out.outputs[0]
+
+                # 累计文本（vLLM 是累计式）
+                new_text = (o.text or "")
+                if len(new_text) > len(think_accum):
+                    delta = new_text[len(think_accum):]
+                    think_accum = new_text
+                else:
+                    delta = ""
+
+                if delta:
+                    if self._THINK_CLOSE.search(delta):
+                        seen_close = True
+                    if self._FA_OPEN.search(delta):
+                        seen_final_open = True
+
+                # token_ids 是“本次补全”的累计长度
+                if o.token_ids is not None:
+                    total_tokens = len(o.token_ids)
+
+                # ================= closeQA 硬停 =================
+                if qa_mode == "closeqa":
+                    # 硬停 A：THINK 中出现完整 <final_answer>...</final_answer>
+                    mfin = self._FA_BLOCK.search(think_accum)
+                    if mfin:
+                        inside = mfin.group(1)
+                        finished = True
+                        await self.abort(main_rid)
+                        return {
+                            "final_text": f"<final_answer>{inside}</final_answer>",
+                            "final_cause": "think_final",
+                            "step_tokens": total_tokens,
+                            "probe_prob": float(last_probe_prob),
+                            "probe_records": probe_records,
+                        }
+
+                    # 硬停 B：出现 </final_answer>（视为已作答，做一次 hard probe）
+                    if (self._FA_CLOSE.search(delta) is not None) or (
+                        self._FA_CLOSE.search(think_accum) is not None
+                    ):
+                        if not seen_close:
+                            suffix = " </think> <final_answer>"
+                        elif not seen_final_open:
+                            suffix = " <final_answer>"
+                        else:
+                            suffix = ""
+                        probe = await self._probe_once(
+                            base_prompt=prompt,
+                            think_accum=think_accum,
+                            suffix=suffix,
+                            probe_max_steps=max(1, probe_max_steps // 2),
+                            topk=topk,
+                            qa_mode=qa_mode,
+                        )
+
+                        slot_hard = compute_probe_slot_from_vllm_steps(
+                            steps_logprobs=probe["steps_logprobs"],
+                            topk=int(topk),
+                            prefer_letter=tracker.current_cum_top_letter(),
+                            probe_text=probe["probe_text"] or "",
+                        )
+                        feats_hard = tracker.update_with_step_vals(
+                            slot_hard["vals"]
+                        )
+                        feats_hard.update(
+                            cum_top_onehot(feats_hard.get("cum_top"))
+                        )
+                        letter_hard = (
+                            slot_hard.get("probe_letter")
+                            or tracker.current_cum_top_letter()
+                            or "A"
+                        )
+                        final_text = f"<final_answer>{letter_hard}</final_answer>"
+
+                        probe_records.append(
+                            {
+                                "step": int(total_tokens),
+                                "kind": "hard_stop",
+                                "probe_text": probe["probe_text"],
+                                "steps_logprobs": probe["steps_logprobs"],
+                                "slot": slot_hard,
+                                "feats": feats_hard,
+                                "classifier_prob": None,
+                                "classifier_letter": None,
+                                "early_stop_triggered": False,
+                                "qa_mode": qa_mode,
+                            }
+                        )
+
+                        finished = True
+                        await self.abort(main_rid)
+                        return {
+                            "final_text": final_text,
+                            "final_cause": "think_final",
+                            "step_tokens": total_tokens,
+                            "probe_prob": 1.0,
+                            "probe_records": probe_records,
+                        }
+
+                # ================= 自然结束（open/close 共用） =================
+                is_finished, fin_reason = self._is_finished_output(o)
+                if is_finished:
+                    finished = True
+                    finish_reason = fin_reason or "finished"
+                    return {
+                        "final_text": think_accum,
+                        "final_cause": finish_reason,
+                        "step_tokens": total_tokens,
+                        "probe_prob": float(last_probe_prob),
+                        "probe_records": probe_records,
+                    }
+
+                # ================= 达到检查步长 -> interval probe =================
+                if total_tokens - last_probe_at >= int(check_interval):
+                    last_probe_at = total_tokens
+
+                    if qa_mode == "closeqa":
+                        if not seen_close:
+                            suffix = " </think> <final_answer>"
+                        elif not seen_final_open:
+                            suffix = " <final_answer>"
+                        else:
+                            suffix = ""
+                    else:
+                        # openQA：suffix 无意义（_probe_once 内部会忽略）
+                        suffix = ""
+
+                    probe = await self._probe_once(
+                        base_prompt=prompt,
+                        think_accum=think_accum,
+                        suffix=suffix,
+                        probe_max_steps=probe_max_steps,
+                        topk=topk,
+                        qa_mode=qa_mode,
+                    )
+
+                    if qa_mode == "closeqa":
+                        slot = compute_probe_slot_from_vllm_steps(
+                            steps_logprobs=probe["steps_logprobs"],
+                            topk=int(topk),
+                            prefer_letter=tracker.current_cum_top_letter(),
+                            probe_text=probe["probe_text"] or "",
+                        )
+                        feats = tracker.update_with_step_vals(slot["vals"])
+                        feats.update(cum_top_onehot(feats.get("cum_top")))
+                        answer_key = None
+                    else:
+                        # openQA / MATH interval probe：fake boxed + brace-balanced 抽取
+                        slot = compute_openqa_slot_from_vllm_steps(
+                            steps_logprobs=probe["steps_logprobs"],
+                            topk=int(topk),
+                        )
+                        probe_text_i = probe["probe_text"] or ""
+                        fake_box_i = f"\\boxed{{{probe_text_i}}}"
+                        answer_key = self._extract_answer_key(fake_box_i)
+                        feats = tracker.update_with_slot(
+                            slot, answer_key=answer_key
+                        )
+
+                    feats["step"] = int(total_tokens)
+
+                    if use_classifier_for_logging:
+                        prob, letter_hint = classifier_callable(feats)
+                    else:
+                        prob, letter_hint = None, None
+
+                    if isinstance(prob, (int, float)):
+                        last_probe_prob = float(prob)
+
+                    record = {
+                        "step": int(total_tokens),
+                        "kind": "interval",
+                        "probe_text": probe["probe_text"],
+                        "steps_logprobs": probe["steps_logprobs"],
+                        "slot": slot,
+                        "feats": feats,
+                        "classifier_prob": float(prob)
+                        if prob is not None
+                        else None,
+                        "classifier_letter": letter_hint,
+                        "early_stop_triggered": False,
+                        "qa_mode": qa_mode,
+                    }
+
+                    # ===== 仅当允许 early_stop 时，才用 classifier+threshold 终止 =====
+                    elig_flag = slot.get("early_stop_elig", qa_mode == "openqa")
+                    if (
+                        use_classifier_for_early_stop
+                        and elig_flag
+                        and (prob is not None)
+                        and float(prob) >= float(threshold)
+                    ):
+                        if qa_mode == "closeqa":
+                            letter = (
+                                slot.get("probe_letter")
+                                or letter_hint
+                                or "A"
+                            )
+                            final_text = (
+                                f"<final_answer>{letter}</final_answer>"
+                            )
+                        else:
+                            # openQA：早停时，只关心 boxed 内部，不使用 <final_answer>
+                            probe_text_es = probe["probe_text"] or ""
+                            fake_box_es = f"\\boxed{{{probe_text_es}}}"
+                            inner = self._extract_answer_key(fake_box_es)
+                            final_text = f"\\boxed{{{inner}}}"
+
+                        record["early_stop_triggered"] = True
+                        probe_records.append(record)
+
+                        finished = True
+                        await self.abort(main_rid)
+                        return {
+                            "final_text": final_text,
+                            "final_cause": "early_stop",
+                            "step_tokens": total_tokens,
+                            "probe_prob": float(prob),
+                            "probe_records": probe_records,
+                        }
+                    else:
+                        probe_records.append(record)
+
+                    await asyncio.sleep(0)
+
+            # 流走到头：统一视作自然结束
+            return {
+                "final_text": think_accum,
+                "final_cause": "finished",
+                "step_tokens": total_tokens,
+                "probe_prob": float(last_probe_prob),
+                "probe_records": probe_records,
+            }
+        finally:
+            # 任何异常/提前返回都确保主流被关闭并 abort，杜绝悬挂序列
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+            if not finished:
+                try:
+                    await self.abort(main_rid)
+                except Exception:
+                    pass
