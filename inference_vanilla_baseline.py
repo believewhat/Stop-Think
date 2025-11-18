@@ -5,6 +5,11 @@ import os, re, time, argparse
 import numpy as np
 import pandas as pd
 
+# 额外依赖：用于 MATH grader
+import sympy
+from sympy.parsing import sympy_parser
+from pylatexenc import latex2text
+
 # ——保持和你环境一致的一些 env（可按需删减）——
 os.environ.setdefault("VLLM_USE_V1", "1")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -33,44 +38,365 @@ def load_df(path: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 # ============================================================
-# 共同：MATH 提取 \boxed{...} & 简单 canonicalization
+# MATH 提取 \boxed{...} & 全套 grader（沿用 async 脚本）
 # ============================================================
 
-_BOXED_RE = re.compile(r"\\boxed\s*\{\s*(.*?)\s*\}", flags=re.S)
+def last_boxed_only_string(string: str):
+    """Return the substring '\\boxed{...}' of the last boxed, including braces (brace-balanced)."""
+    if not isinstance(string, str):
+        return None
+    idx = string.rfind("\\boxed")
+    if idx < 0:
+        idx = string.rfind("\\fbox")
+        if idx < 0:
+            return None
+    i = idx
+    right_brace_idx = None
+    num_left_braces_open = 0
+    while i < len(string):
+        ch = string[i]
+        if ch == "{":
+            num_left_braces_open += 1
+        if ch == "}":
+            num_left_braces_open -= 1
+            if num_left_braces_open == 0:
+                right_brace_idx = i
+                break
+        i += 1
+    if right_brace_idx is None:
+        return None
+    return string[idx:right_brace_idx + 1]
+
+
+def remove_boxed(s: str):
+    left = "\\boxed{"
+    try:
+        assert s[:len(left)] == left
+        assert s[-1] == "}"
+        return s[len(left):-1]
+    except Exception:
+        return None
+
 
 def extract_boxed_answer(s: str) -> str:
-    """从字符串中抽取最后一个 \\boxed{...} 的内容；没有则返回空串。"""
+    """Extract inside of the last \\boxed{...} from a LaTeX string (robust)."""
     if not isinstance(s, str):
         return ""
-    m = _BOXED_RE.findall(s)
-    return m[-1].strip() if m else ""
+    chunk = last_boxed_only_string(s)
+    return remove_boxed(chunk) if chunk is not None else ""
+
 
 def canon_simple(s: str) -> str:
-    """轻量 canonicalization，用于便宜的等价判断（不走 sympy）。"""
+    """A very light canonicalization for cheap equality checks."""
     if not isinstance(s, str):
         return ""
     t = s.strip()
     t = t.replace("–", "-").replace("−", "-")
-    t = (t.replace("\\,", "")
-           .replace("\\;", "")
-           .replace("\\!", "")
-           .replace("\\left", "")
-           .replace("\\right", ""))
+    t = (t.replace("\\,", "").replace("\\;", "").replace("\\!", "")
+           .replace("\\left", "").replace("\\right", ""))
     t = re.sub(r"\\text\{([^}]*)\}", r"\1", t)
     t = t.replace("tfrac", "frac").replace("dfrac", "frac")
     t = t.replace("^{\\circ}", "").replace("^\\circ", "")
     t = t.replace(" ", "").strip("$")
     return t
 
-def grade_math_simple(pred: str, gold: str) -> bool:
-    """简单 EM：canonicalization 后字符串相等。"""
+
+BAD_SUBSTRINGS = ["^{", "^("]
+BAD_REGEXES = [r"\^[0-9]+\^", r"\^[0-9][0-9]+"]
+TUPLE_CHARS = "()[]"
+
+
+def mathd_normalize_answer(answer):
+    if answer is None:
+        return None
+    answer = answer.strip()
+    try:
+        m = re.search(r"^\\text\{(?P<text>.+?)\}$", answer)
+        if m is not None:
+            answer = m.group("text").strip()
+        return _strip_string(answer)
+    except Exception:
+        return answer
+
+
+def _strip_string(string):
+    def _fix_fracs(string):
+        substrs = string.split("\\frac")
+        new_str = substrs[0]
+        if len(substrs) > 1:
+            substrs = substrs[1:]
+            for substr in substrs:
+                new_str += "\\frac"
+                if substr and substr[0] == "{":
+                    new_str += substr
+                else:
+                    try:
+                        assert len(substr) >= 2
+                    except Exception:
+                        return string
+                    a = substr[0]
+                    b = substr[1]
+                    if b != "{":
+                        if len(substr) > 2:
+                            post_substr = substr[2:]
+                            new_str += "{" + a + "}{" + b + "}" + post_substr
+                        else:
+                            new_str += "{" + a + "}{" + b + "}"
+                    else:
+                        if len(substr) > 2:
+                            post_substr = substr[2:]
+                            new_str += "{" + a + "}" + b + post_substr
+                        else:
+                            new_str += "{" + a + "}" + b
+        return new_str
+
+    def _fix_a_slash_b(string):
+        if len(string.split("/")) != 2:
+            return string
+        a = string.split("/")[0]
+        b = string.split("/")[1]
+        try:
+            a = int(a); b = int(b)
+            assert string == "{}/{}".format(a, b)
+            return "\\frac{" + str(a) + "}{" + str(b) + "}"
+        except Exception:
+            return string
+
+    def _remove_right_units(string):
+        if "\\text{ " in string:
+            splits = string.split("\\text{ ")
+            return splits[0]
+        return string
+
+    def _fix_sqrt(string):
+        if "\\sqrt" not in string:
+            return string
+        splits = string.split("\\sqrt")
+        new_string = splits[0]
+        for split in splits[1:]:
+            if split and split[0] != "{":
+                a = split[0]
+                new_substr = "\\sqrt{" + a + "}" + split[1:]
+            else:
+                new_substr = "\\sqrt" + split
+            new_string += new_substr
+        return new_string
+
+    string = (string or "").replace("\n", "")
+    string = string.replace("\\!", "")
+    string = string.replace("\\\\", "\\")
+    string = string.replace("tfrac", "frac").replace("dfrac", "frac")
+    string = string.replace("\\left", "").replace("\\right", "")
+    string = string.replace("^{\\circ}", "").replace("^\\circ", "")
+    string = string.replace("\\$", "")
+    string = _remove_right_units(string)
+    string = string.replace("\\%", "").replace("\%", "")
+    string = string.replace(" .", " 0.").replace("{.", "{0.")
+    if string and string[0] == ".":
+        string = "0" + string
+    if len(string.split("=")) == 2:
+        if len(string.split("=")[0]) <= 2:
+            string = string.split("=")[1]
+    string = _fix_sqrt(string)
+    string = string.replace(" ", "")
+    string = _fix_fracs(string)
+    if string == "0.5":
+        string = "\\frac{1}{2}"
+    string = _fix_a_slash_b(string)
+    return string
+
+
+def _sympy_parse(expr: str):
+    py_expr = expr.replace("^", "**")
+    return sympy_parser.parse_expr(
+        py_expr,
+        transformations=(
+            sympy_parser.standard_transformations
+            + (sympy_parser.implicit_multiplication_application,)
+        ),
+    )
+
+
+def _parse_latex(expr: str) -> str:
+    expr = expr.replace("\\tfrac", "\\frac").replace("\\dfrac", "\\frac")
+    expr = expr.replace("\\frac", " \\frac")  # mixed numbers
+    expr = latex2text.LatexNodes2Text().latex_to_text(expr)
+    expr = (expr.replace("√", "sqrt")
+                 .replace("π", "pi")
+                 .replace("∞", "inf")
+                 .replace("∪", "U")
+                 .replace("·", "*")
+                 .replace("×", "*"))
+    return expr.strip()
+
+
+def _is_float(num: str) -> bool:
+    try:
+        float(num); return True
+    except Exception:
+        return False
+
+
+def _is_int(x: float) -> bool:
+    try:
+        return abs(x - int(round(x))) <= 1e-7
+    except Exception:
+        return False
+
+
+def _strip_properly_formatted_commas(expr: str):
+    p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
+    while True:
+        next_expr = p1.sub(r"\1\3\4", expr)
+        if next_expr == expr:
+            break
+        expr = next_expr
+    return next_expr
+
+
+def _str_is_int(x: str) -> bool:
+    try:
+        x = _strip_properly_formatted_commas(x)
+        x = float(x)
+        return abs(x - int(round(x))) <= 1e-7
+    except Exception:
+        return False
+
+
+def _str_to_int(x: str) -> int:
+    x = x.replace(",", "")
+    x = float(x)
+    return int(x)
+
+
+def _inject_implicit_mixed_number(step: str):
+    p1 = re.compile(r"([0-9]) +([0-9])")
+    step = p1.sub(r"\1+\2", step)
+    return step
+
+
+def _normalize(expr: str) -> str:
+    if expr is None:
+        return None
+    m = re.search(r"^\\text\{(?P<text>.+?)\}$", expr)
+    if m is not None:
+        expr = m.group("text")
+    expr = (expr.replace("\\%", "%")
+                .replace("\\$", "$")
+                .replace("$", "")
+                .replace("%", "")
+                .replace(" or ", " , ")
+                .replace(" and ", " , "))
+    for unit in [
+        "degree","cm","centimeter","meter","mile","second","minute","hour","day","week",
+        "month","year","foot","feet","inch","yard",
+    ]:
+        expr = re.sub(f"{unit}(es)?(s)? *(\\^[0-9]+)?", "", expr)
+    expr = re.sub(r"\^ *\\circ", "", expr)
+    if len(expr) > 0 and expr[0] == "{" and expr[-1] == "}":
+        expr = expr[1:-1]
+    expr = re.sub(r",\\! *", "", expr)
+    if _is_float(expr) and _is_int(float(expr)):
+        expr = str(int(round(float(expr))))
+    if "\\" in expr:
+        try:
+            expr = _parse_latex(expr)
+        except Exception:
+            pass
+    expr = re.sub(r"- *", "-", expr)
+    expr = _inject_implicit_mixed_number(expr)
+    expr = expr.replace(" ", "")
+    expr = expr.replace("{", "").replace("}", "")
+    expr = expr.lower()
+    if _str_is_int(expr):
+        expr = str(_str_to_int(expr))
+    return expr
+
+
+def split_tuple(expr: str):
+    expr = _strip_properly_formatted_commas(expr)
+    if len(expr) == 0:
+        return []
+    if (
+        len(expr) > 2
+        and expr[0] in TUPLE_CHARS
+        and expr[-1] in TUPLE_CHARS
+        and all([ch not in expr[1:-1] for ch in TUPLE_CHARS])
+    ):
+        elems = [elem.strip() for elem in expr[1:-1].split(",")]
+    else:
+        elems = [expr]
+    return elems
+
+
+def _is_frac(expr: str) -> bool:
+    return bool(re.search(r"^-?[0-9]+.?/0*[1-9][0-9]*.?$", expr))
+
+
+def should_allow_eval(expr: str):
+    for bad_string in BAD_SUBSTRINGS:
+        if bad_string in expr:
+            return False
+    for bad_regex in BAD_REGEXES:
+        if re.search(bad_regex, expr) is not None:
+            return False
+    return True
+
+
+def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str) -> bool:
+    try:
+        expr = f"({ground_truth_normalized})-({given_normalized})"
+        if should_allow_eval(expr):
+            sympy_diff = _sympy_parse(expr)
+            simplified = sympy.simplify(sympy_diff)
+            return simplified == 0
+    except Exception:
+        pass
+    return False
+
+
+def grade_answer_sympy(given_answer: str, ground_truth: str) -> bool:
+    given = _normalize(given_answer)
+    gold  = _normalize(ground_truth)
     if gold is None:
         return False
-    cp = canon_simple(pred)
-    cg = canon_simple(gold)
-    if not cg:
+    if gold == given:
+        return True
+    if not given:
         return False
-    return cp == cg
+    gold_elems = split_tuple(gold)
+    given_elems = split_tuple(given)
+    if len(gold_elems) > 1 and (gold[0] != given[0] or gold[-1] != given[-1]):
+        return False
+    if len(gold_elems) != len(given_elems):
+        return False
+    for ge, pe in zip(gold_elems, given_elems):
+        if _is_frac(ge) and _is_frac(pe):
+            ok = (ge == pe)
+        elif _str_is_int(ge) != _str_is_int(pe):
+            ok = False
+        else:
+            ok = are_equal_under_sympy(ge, pe)
+        if not ok:
+            return False
+    return True
+
+
+def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
+    gold = mathd_normalize_answer(ground_truth)
+    pred = mathd_normalize_answer(given_answer)
+    return (gold == pred)
+
+
+def grade_answer(given_answer: str, ground_truth: str) -> bool:
+    """final grade (shape → MathD → SymPy)"""
+    if given_answer is None or ground_truth is None:
+        return False
+    if canon_simple(given_answer) == canon_simple(ground_truth):
+        return True
+    if grade_answer_mathd(given_answer, ground_truth):
+        return True
+    return grade_answer_sympy(given_answer, ground_truth)
 
 # ============================================================
 # MedQA: 提取 <final_answer> 的字母
@@ -106,7 +432,7 @@ def map_gold(x):
     return m.group(0).upper() if m else None
 
 # ============================================================
-# Prompt 构造：MedQA 多选题
+# Prompt 构造：MedQA 多选题（恢复 <final_answer>）
 # ============================================================
 
 TASK = "Please output a single best option from Choices as your final answer."
@@ -129,7 +455,6 @@ def build_user_medqa(question, choices):
     )
 
 def build_base_prompt_medqa(question, choices):
-    # 与你之前 online early-stop 的 system/user/assistant 模式保持一致
     return (
         f"<system>{SYS_MEDQA}</system>\n"
         f"user\n{build_user_medqa(question, choices)}\n"
@@ -137,14 +462,14 @@ def build_base_prompt_medqa(question, choices):
     )
 
 # ============================================================
-# Prompt 构造：MATH-500 openQA 版本
+# Prompt 构造：MATH-500 openQA 版本（与你 async 脚本一致）
 # ============================================================
 
 SYS_MATH = (
     "You are an expert math problem solver.\n"
     "Please solve the problem step by step. "
     "First, write your detailed reasoning inside <think>...</think>. "
-    "Then, provide your final answer inside \\boxed{}."
+    "Then, provide your final answer inside \\boxed{}"
 )
 
 def build_user_math(problem: str) -> str:
@@ -152,16 +477,12 @@ def build_user_math(problem: str) -> str:
         "Here is a math problem:\n"
         f"{problem}\n\n"
         "Please provide detailed reasoning inside <think>...</think> and then "
-        "output your final answer inside \\boxed{}."
+        "output your final answer inside \\boxed{}"
     )
 
 def build_base_prompt_math(problem: str) -> str:
-    # 与之前 math early-stop 版本对齐：assistant\n<think> 开场
-    return (
-        f"<system>{SYS_MATH}</system>\n"
-        f"user\n{build_user_math(problem)}\n"
-        "assistant\n<think> "
-    )
+    # 与 generate_with_checks 的约定：以 assistant\n<think> 开场
+    return f"<system>{SYS_MATH}</system>\nuser\n{build_user_math(problem)}\nassistant\n<think> "
 
 # ============================================================
 # 主流程：vanilla 同步推理（支持 MedQA + MATH-500）
@@ -247,7 +568,7 @@ def main():
             extra_cols.append({})  # 占位
     else:
         # ---------- MATH-500: 组 prompt ----------
-        # 约定：gold = 从 solution 的最后一个 \boxed{} 抽；若没有，则用 answer 字段
+        # gold 在后面用 solution/answer_raw 再重新算，这里先占位
         for _, row in df.iterrows():
             qid = row["qid"]
             problem  = row.get("problem", "")
@@ -258,15 +579,16 @@ def main():
             prompts.append(base_prompt)
             qids.append(qid)
 
-            gt_from_solution = extract_boxed_answer(solution)
-            gt_text = gt_from_solution if gt_from_solution else (answer if isinstance(answer, str) else "")
-            golds.append(gt_text)
+            # gold 先留空；真正 GT 用 solution/answer_raw 再推
+            golds.append(None)
 
             extra_cols.append({
+                "unique_id": row.get("unique_id", ""),
+                "subject": row.get("subject", ""),
+                "level": row.get("level", ""),
                 "problem": problem,
                 "solution": solution,
                 "answer_raw": answer,
-                "gt_text": gt_text,
             })
 
     N = len(prompts)
@@ -288,7 +610,6 @@ def main():
         top_p=float(args.top_p),
         repetition_penalty=float(args.rep),
         max_tokens=int(args.max_tokens),
-        # vanilla：这里不早停，不加 stop / stop_token_ids
     )
 
     # ---------- 同步批推理 ----------
@@ -324,7 +645,6 @@ def main():
 
         for out, qid, gold, extra in zip(outputs, batch_qids, batch_golds, batch_extra):
             try:
-                # vLLM 每个请求通常只有一个 output
                 text = out.outputs[0].text if out.outputs else ""
                 gen_tok = len(out.outputs[0].token_ids) if out.outputs else None
                 total_gen_tokens += (gen_tok or 0)
@@ -381,30 +701,56 @@ def main():
             flush=True,
         )
     else:
-        # MATH-500: openQA EM
+        # MATH-500: 用和 async early-stop 一致的 EM 计算
+        out["gt_from_solution_box"] = out["solution"].apply(extract_boxed_answer)
+        out["gt_text"] = out.apply(
+            lambda r: (
+                r["gt_from_solution_box"]
+                if isinstance(r["gt_from_solution_box"], str)
+                and len(r["gt_from_solution_box"]) > 0
+                else (r["answer_raw"] if isinstance(r["answer_raw"], str) else "")
+            ),
+            axis=1,
+        )
+
         out["pred_boxed"] = out["final_text"].map(extract_boxed_answer)
-        # gold 已经是 canonical GT（来自 solution 的 boxed 或 answer）
-        out["gt_text"] = out["gold"].astype(str).fillna("")
 
         mask_eval = out["gt_text"].astype(str).str.len() > 0
         if mask_eval.any():
             out.loc[mask_eval, "is_correct"] = out.loc[mask_eval].apply(
-                lambda r: grade_math_simple(r["pred_boxed"], r["gt_text"]), axis=1
+                lambda r: grade_answer(r["pred_boxed"], r["gt_text"]), axis=1
             )
             em = float(out.loc[mask_eval, "is_correct"].mean())
+            print(f"[Eval] Evaluated {int(mask_eval.sum())}/{len(out)} rows | EM = {em:.4f}")
         else:
             out["is_correct"] = None
-            em = float("nan")
+            print("[Eval] No GT available (neither parsable \\boxed{...} in solution nor `answer`).")
 
         avg_gen_tok = pd.to_numeric(out["gen_tokens"], errors="coerce").dropna().mean()
-
         print(
-            f"[SUMMARY] (MATH-500) EM={em*100:.2f}% "
-            f"| avg_gen_tokens={avg_gen_tok:.1f} "
+            f"[SUMMARY] (MATH-500) avg_gen_tokens={avg_gen_tok:.1f} "
             f"| elapsed={elapsed:.1f}s "
             f"| tok/s={total_gen_tokens/elapsed if elapsed>0 else 0:.1f}",
             flush=True,
         )
+
+        # 简单 sanity check 表（和 async 版保持风格）
+        dbg = out.loc[mask_eval, ["qid", "pred_boxed", "gt_text"]].head(12).copy()
+        if len(dbg) > 0:
+            dbg["pred_simple"] = dbg["pred_boxed"].map(canon_simple)
+            dbg["gt_simple"]   = dbg["gt_text"].map(canon_simple)
+            dbg["eq_simple"]   = (dbg["pred_simple"] == dbg["gt_simple"])
+            dbg["eq_mathd"]    = dbg.apply(
+                lambda r: grade_answer_mathd(r["pred_boxed"], r["gt_text"]), axis=1
+            )
+            dbg["eq_sympy"]    = dbg.apply(
+                lambda r: grade_answer_sympy(r["pred_boxed"], r["gt_text"]), axis=1
+            )
+            dbg["is_correct"]  = dbg.apply(
+                lambda r: grade_answer(r["pred_boxed"], r["gt_text"]), axis=1
+            )
+            print("Sanity check (first 12 with GT):")
+            print(dbg)
 
 if __name__ == "__main__":
     main()
@@ -441,10 +787,10 @@ CUDA_VISIBLE_DEVICES=2 python -u inference_vanilla_baseline.py \
   --temp 0.6 \
   --top_p 0.95 \
   --rep 1.2 \
-  --max_tokens 8000 \
+  --max_tokens 20000 \
   --batch_size 32 \
   --gpu_util 0.8 \
-  --max_model_len 8000 \
+  --max_model_len 20000 \
   --max_num_seqs 128 \
   --trust_remote_code
 """
