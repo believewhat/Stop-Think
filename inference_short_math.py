@@ -412,23 +412,83 @@ def build_base_prompt(problem: str) -> str:
 
 
 # ---------- 用 joblib 模型构造 classifier_callable ----------
-def make_classifier_callable(joblib_pack):
+def make_classifier_callable(joblib_pack, device: str = "cuda:0"):
     """
-    引擎在每次 probe 后会把“在线特征字典 feats_dict”传进来（键名与 feats_order 对齐）。
-    这里把它排成 joblib 模型需要的顺序，输出 (prob, letter_hint)。
-    openQA 下 letter_hint 可以忽略（返回 None 即可）。
+    device: "cpu"、"cuda" 或 "cuda:0" 之类。
+    GPU 路径依赖 cupy；若不可用会自动回退到 CPU。
     """
     clf = joblib_pack["model"]
     feats_order = joblib_pack["feats"]
 
+    booster = None
+    use_gpu = False
+    gpu_index = 0
+
+    # 取出 XGBoost booster 并设置设备
+    try:
+        import xgboost as xgb  # 确保 2.x
+        if hasattr(clf, "get_booster"):
+            booster = clf.get_booster()
+            if isinstance(device, str) and device.lower().startswith("cuda"):
+                # 解析 cuda:idx
+                if ":" in device:
+                    try:
+                        gpu_index = int(device.split(":")[1])
+                    except Exception:
+                        gpu_index = 0
+                booster.set_param({"device": device})  # XGBoost >= 2.0
+                use_gpu = True
+            else:
+                booster.set_param({"device": "cpu"})
+        else:
+            # 万一不是 xgboost 包装器（比如换成别的模型），直接走 CPU 路径
+            use_gpu = False
+    except Exception:
+        booster = None
+        use_gpu = False
+
+    # 尝试导入 cupy（只在 GPU 路径用）
+    cupy_ok = False
+    if use_gpu:
+        try:
+            import cupy as cp  # 需要与你 CUDA 匹配的版本，如 cupy-cuda12x
+            cupy_ok = True
+        except Exception:
+            cupy_ok = False
+            use_gpu = False  # 没有 cupy 就退回 CPU
+
     def _call(feats_dict):
+        # 按已训练时的列顺序组一行特征
         row = [float(feats_dict.get(k, 0.0)) for k in feats_order]
+
+        # ===== GPU 路径：CuPy + inplace_predict，避免设备不匹配告警 =====
+        if use_gpu and booster is not None and cupy_ok:
+            import cupy as cp
+            # 固定到指定 GPU（可选）
+            with cp.cuda.Device(gpu_index):
+                X = cp.asarray(row, dtype=cp.float32)[None, :]  # shape (1, D) on GPU
+                # 二分类 -> 概率向量或标量；这里统一取正类概率
+                pred = booster.inplace_predict(X, predict_type="probability")
+                # pred 可能是 cupy.ndarray
+                if pred.ndim == 1:
+                    prob = float(pred.get()[0])
+                else:
+                    prob = float(pred.get()[0, 1])
+            letter_hint = None  # openQA 无 ABCD
+            return prob, letter_hint
+
+        # ===== CPU 回退路径：sklearn API =====
+        import numpy as np
         X = np.asarray([row], dtype=float)
         if hasattr(clf, "predict_proba"):
-            prob = float(clf.predict_proba(X)[0, 1])
+            p = clf.predict_proba(X)
+            prob = float(p[0, 1]) if p.ndim == 2 and p.shape[1] == 2 else float(p[0])
+        elif hasattr(clf, "decision_function"):
+            from scipy.special import expit
+            prob = float(expit(clf.decision_function(X))[0])
         else:
-            prob = float(clf.predict(X))
-        # openQA 没有 ABCD，这里直接给 None
+            prob = float(clf.predict(X)[0])
+
         letter_hint = None
         return prob, letter_hint
 
@@ -795,25 +855,25 @@ CUDA_VISIBLE_DEVICES=0 python inference_short_math.py \
   --tp 1 \
   --threshold 0.95 \
   --token_step 50 \
-  --probe_max 30 \
+  --probe_max 20 \
   --topk 20 \
   --out_csv online_earlystop_results_math500.csv \
   --probe_jsonl online_earlystop_probe_records_math500.jsonl
 
 若要启用 classifier 早停：
 
-CUDA_VISIBLE_DEVICES=1 python inference_short_math.py \
+CUDA_VISIBLE_DEVICES=0 python inference_short_math.py \
   --input_path /home/jwang/Project/qwen3_output/data/MATH-500/test.jsonl \
   --model_path /data/data_user_alpha/public_models/Qwen3/Qwen3-8B \
   --dtype bfloat16 \
   --tp 1 \
-  --threshold 0.9 \
+  --threshold 0.95 \
   --token_step 50 \
-  --probe_max 30 \
+  --probe_max 20 \
   --topk 20 \
   --out_csv online_earlystop_results_math500.csv \
   --probe_jsonl online_earlystop_probe_records_math500_2.jsonl \
-  --cls_model_path model_classifier/early_stop_cls_math.joblib \
+  --cls_model_path model_classifier/early_stop_cls.joblib  \
   --enable_early_stop 
 
 CUDA_VISIBLE_DEVICES=0 python inference_short_math.py \
