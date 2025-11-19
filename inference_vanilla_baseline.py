@@ -41,49 +41,71 @@ def load_df(path: str) -> pd.DataFrame:
 # MATH 提取 \boxed{...} & 全套 grader（沿用 async 脚本）
 # ============================================================
 
-def last_boxed_only_string(string: str):
-    """Return the substring '\\boxed{...}' of the last boxed, including braces (brace-balanced)."""
+def last_boxed_only_string(string: str) -> str | None:
+    """
+    返回最后一个 \\boxed{...}（或 \\fbox{...}）的完整子串，包含最外层花括号。
+    通过手动计数花括号来避免被嵌套环境 (\begin{pmatrix} ... ) 截断。
+    """
     if not isinstance(string, str):
         return None
-    idx = string.rfind("\\boxed")
-    if idx < 0:
-        idx = string.rfind("\\fbox")
-        if idx < 0:
+
+    # 先找最后一个 \boxed 或 \fbox
+    start = string.rfind(r"\boxed")
+    if start < 0:
+        start = string.rfind(r"\fbox")
+        if start < 0:
             return None
-    i = idx
-    right_brace_idx = None
-    num_left_braces_open = 0
-    while i < len(string):
+
+    # 找到紧跟其后的第一个 '{'
+    brace_start = string.find("{", start)
+    if brace_start < 0:
+        return None
+
+    depth = 0
+    end = None
+    for i in range(brace_start, len(string)):
         ch = string[i]
         if ch == "{":
-            num_left_braces_open += 1
-        if ch == "}":
-            num_left_braces_open -= 1
-            if num_left_braces_open == 0:
-                right_brace_idx = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
                 break
-        i += 1
-    if right_brace_idx is None:
+
+    if end is None:
+        # 没有配平，说明模型输出本身就是不完整的 \boxed{...，
+        # 这种情况没法“恢复”，直接返回 None
         return None
-    return string[idx:right_brace_idx + 1]
+
+    return string[start:end + 1]
 
 
-def remove_boxed(s: str):
-    left = "\\boxed{"
+def remove_boxed(s: str) -> str | None:
+    """
+    去掉最外层的 \\boxed{...} 壳，返回内部内容。
+    """
+    left = r"\boxed{"
     try:
-        assert s[:len(left)] == left
-        assert s[-1] == "}"
+        assert s.startswith(left)
+        assert s.endswith("}")
         return s[len(left):-1]
     except Exception:
         return None
 
 
 def extract_boxed_answer(s: str) -> str:
-    """Extract inside of the last \\boxed{...} from a LaTeX string (robust)."""
+    """
+    从任意生成文本中提取最后一个 \\boxed{...} 的内部内容。
+    提取失败时返回空串 ""。
+    """
     if not isinstance(s, str):
         return ""
     chunk = last_boxed_only_string(s)
-    return remove_boxed(chunk) if chunk is not None else ""
+    if chunk is None:
+        return ""
+    inner = remove_boxed(chunk)
+    return inner if isinstance(inner, str) else ""
 
 
 def canon_simple(s: str) -> str:
