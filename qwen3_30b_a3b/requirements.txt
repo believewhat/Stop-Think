@@ -1,0 +1,11 @@
+joblib==1.5.0
+lightgbm==4.6.0
+math-verify==0.7.0
+numpy==2.2.6
+pandas==2.2.3
+pylatexenc==2.10
+pytest==8.3.5
+scikit-learn==1.6.1
+scipy==1.15.3
+sympy==1.14.0
+transformers==4.53.3
