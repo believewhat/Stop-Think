@@ -180,13 +180,17 @@ In the released DAPO implementation:
 - Online dual-classifier fitting uses A70 causal features and all physical
   candidate records. `classifier_affects_dapo=False`: classifier predictions do
   not accept/reject training stops; ground-truth verification does.
-- The released math classifiers use a different 22-feature contract and cannot
-  be substituted for these MedQA online classifiers.
+- The released [math classifiers](../../qwen3_30b_a3b/classifiers/README.md)
+  and [offline MedQA classifier](../../qwen3_30b_a3b/classifiers_medqa/README.md)
+  have distinct 22-feature contracts. Neither can replace these A70 online
+  classifiers, even though the offline medical weight also uses the 30B backbone.
 
 Classifier snapshots and batch audits are written under each run's `logs/`.
 Actor checkpoints omit optimizer/scheduler/RNG state; they support evaluation
 or a separately specified restart, **not lossless training resumption**.
-No completed DAPO policy or new medical classifier pickle is published here.
+No completed DAPO policy or online A70 classifier weight is published here.
+The separately released offline MedQA weight is for ESTAR-LITE, not this DAPO
+training recipe.
 
 ## Tests and provenance
 

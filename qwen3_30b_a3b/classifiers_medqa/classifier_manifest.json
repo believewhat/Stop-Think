@@ -1,0 +1,35 @@
+{
+  "schema": "qwen30a3b_medqa_legacy_classifier_train_v1",
+  "backbone": "Qwen/Qwen3-30B-A3B",
+  "model_output": "early_stop_cls_medqa_qwen30a3b.joblib",
+  "parts": [
+    {"directory": "train/shard_0/trajectory", "index": 0, "probe_rows": 60588, "qids": 2545},
+    {"directory": "train/shard_1/trajectory", "index": 1, "probe_rows": 60352, "qids": 2545},
+    {"directory": "train/shard_2/trajectory", "index": 2, "probe_rows": 61471, "qids": 2544},
+    {"directory": "train/shard_3/trajectory", "index": 3, "probe_rows": 61725, "qids": 2544}
+  ],
+  "train_qids": 10178,
+  "train_probe_rows": 244136,
+  "positive_rate": 0.8345880984369368,
+  "features": [
+    "cum_A", "cum_B", "cum_C", "cum_D", "cum_margin", "run_len", "flips",
+    "delta_recent", "slope_recent", "inst_sA", "inst_sB", "inst_sC", "inst_sD",
+    "curv_margin2", "curv_cum_A2", "curv_cum_B2", "curv_cum_C2", "curv_cum_D2",
+    "cum_top_A", "cum_top_B", "cum_top_C", "cum_top_D"
+  ],
+  "excluded_feature": "changed_prev",
+  "qid_holdout_fraction": 0.1,
+  "qid_holdout_random_state": 42,
+  "xgboost": {
+    "n_estimators": 500,
+    "learning_rate": 0.05,
+    "max_depth": 6,
+    "min_child_weight": 2,
+    "subsample": 0.9,
+    "colsample_bytree": 0.9,
+    "random_state": 42,
+    "tree_method": "hist"
+  },
+  "deployment_threshold": 0.95,
+  "label": "probe_letter_matches_same_trajectory_final_letter"
+}

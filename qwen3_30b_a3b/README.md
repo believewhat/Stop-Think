@@ -1,7 +1,10 @@
 # Qwen3-30B-A3B ESTAR-Lite
 
 For current MedQA policy training, see the separate
-[SFT and DAPO examples](../training/medqa/README.md). The results below retain
+[SFT and DAPO examples](../training/medqa/README.md). The offline
+[30B MedQA classifier, also used on JAMA](classifiers_medqa/README.md), is
+released separately and uses a different feature contract from math.
+The results below retain
 this historical math release's **THINK-only** length metric; the updated
 [manuscript tables](../README.md#paper-reported-main-results) use output tokens.
 
@@ -63,6 +66,8 @@ intervals are wide. Full validation metrics, hashes, and label counts are in
   classifier policy evaluation, and tests.
 - `classifiers/`: trained models, model card, metrics, feature order, and
   checksums.
+- `classifiers_medqa/`: the separate MedQA-trained 30B XGBoost weight, feature
+  order, provenance, CPU dependency pins, and scoring example.
 
 ## Environment
 

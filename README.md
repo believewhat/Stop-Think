@@ -13,7 +13,9 @@ classifier at inference time; **ESTAR** also trains the reasoning policy.
   inference, data preparation, classifier training, and MATH-500/AIME2024 evaluation.
 - **[Released Qwen3-30B-A3B math classifiers](qwen3_30b_a3b/classifiers/)**:
   final-consistency and gold-safe classifiers, feature order, and model cards.
-  Only Qwen3-30B-A3B classifier weights are distributed in the current tree.
+- **[Released Qwen3-30B-A3B MedQA classifier](qwen3_30b_a3b/classifiers_medqa/)**:
+  the model-specific offline ESTAR-LITE medical weight, also used on JAMA,
+  with its 22-feature schema and threshold 0.95.
 - **[Three-run statistics](docs/results.md)**: accuracy and output-token means,
   SDs, and 95% confidence intervals for Qwen3-30B-A3B.
 
@@ -22,8 +24,10 @@ math pipeline or the legacy code under `EarlyStop/` and `vllm/`.
 Legacy classifier binaries formerly under `model_classifier/` are no longer
 included. Legacy inference examples require your own compatible classifier;
 do not substitute the 30B math weights into a different model or feature schema.
-MedQA DAPO fits its own online classifiers; medical classifier weights are not
-part of this release.
+Only Qwen3-30B-A3B classifier weights are distributed in the current tree.
+The released offline MedQA weight and the math weights use different feature
+contracts. MedQA DAPO fits separate online A70 classifiers; their weights are
+not part of this release.
 
 ## Paper-reported main results
 
