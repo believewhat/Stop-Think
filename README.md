@@ -11,13 +11,19 @@ classifier at inference time; **ESTAR** also trains the reasoning policy.
   Fill in your own model, dataset, GPU, and output paths.
 - **[Qwen3-30B-A3B math ESTAR-LITE](qwen3_30b_a3b/README.md)**:
   inference, data preparation, classifier training, and MATH-500/AIME2024 evaluation.
-- **[Released math classifiers](qwen3_30b_a3b/classifiers/)**:
+- **[Released Qwen3-30B-A3B math classifiers](qwen3_30b_a3b/classifiers/)**:
   final-consistency and gold-safe classifiers, feature order, and model cards.
+  Only Qwen3-30B-A3B classifier weights are distributed in the current tree.
 - **[Three-run statistics](docs/results.md)**: accuracy and output-token means,
   SDs, and 95% confidence intervals for Qwen3-30B-A3B.
 
 The new MedQA runtime is an **opt-in overlay**. It does not replace the existing
 math pipeline or the legacy code under `EarlyStop/` and `vllm/`.
+Legacy classifier binaries formerly under `model_classifier/` are no longer
+included. Legacy inference examples require your own compatible classifier;
+do not substitute the 30B math weights into a different model or feature schema.
+MedQA DAPO fits its own online classifiers; medical classifier weights are not
+part of this release.
 
 ## Paper-reported main results
 

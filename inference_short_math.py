@@ -895,7 +895,7 @@ CUDA_VISIBLE_DEVICES=0 python inference_short_math.py \
   --topk 20 \
   --out_csv online_earlystop_results_math500.csv \
   --probe_jsonl online_earlystop_probe_records_math500_2.jsonl \
-  --cls_model_path model_classifier/early_stop_cls.joblib  \
+  --cls_model_path /path/to/your_compatible_classifier.joblib  \
   --enable_early_stop 
 
 CUDA_VISIBLE_DEVICES=0 python inference_short_math.py \

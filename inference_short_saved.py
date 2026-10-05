@@ -405,7 +405,7 @@ CUDA_VISIBLE_DEVICES=0 python inference_short_saved.py \
   --model_path /data/data_user_alpha/public_models/Qwen3/Qwen3-8B \
   --dtype bfloat16 \
   --tp 1 \
-  --cls_model_path model_classifier/early_stop_cls.joblib \
+  --cls_model_path /path/to/your_compatible_classifier.joblib \
   --threshold 0.95 \
   --token_step 50 \
   --probe_max 10 \

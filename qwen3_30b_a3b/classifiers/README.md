@@ -1,7 +1,10 @@
-# Released classifiers
+# Released Qwen3-30B-A3B math classifiers
 
 Both artifacts are LightGBM binary classifiers packaged with their feature
 order, schema hashes, training provenance, threshold, and target label.
+They were trained on Qwen3-30B-A3B trajectories. These are the only classifier
+weights distributed in the current repository tree; they are not medical
+classifiers and are not interchangeable with 8B or other-backbone classifiers.
 
 | File | Target | Threshold | Intended behavior |
 | --- | --- | ---: | --- |

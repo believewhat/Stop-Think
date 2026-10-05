@@ -438,7 +438,7 @@ if __name__ == "__main__":
 python online_classifier_train.py \
   --train_probe_jsonl online_earlystop_probe_records_train.jsonl \
   --test_probe_jsonl online_earlystop_probe_records.jsonl \
-  --model_out model_classifier/early_stop_cls.joblib \
+  --model_out /path/to/your_compatible_classifier.joblib \
   --out_pred_csv early_stop_cls_step_preds.csv \
   --threshold 0.95 \
   --force_retrain
