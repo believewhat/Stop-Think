@@ -1,0 +1,28 @@
+# Linux training environment. Install matching CUDA wheels before this file.
+torch==2.7.0
+vllm==0.9.0
+transformers==4.53.3
+accelerate==1.9.0
+peft==0.15.2
+tokenizers==0.21.1
+safetensors==0.5.3
+ray==2.46.0
+opentelemetry-api==1.26.0
+opentelemetry-sdk==1.26.0
+opentelemetry-semantic-conventions==0.47b0
+tensordict==0.6.2
+torchdata==0.11.0
+hydra-core==1.3.2
+pandas==2.2.3
+pyarrow==21.0.0
+numpy==1.26.4
+lightgbm==4.6.0
+scikit-learn==1.6.1
+math-verify==0.7.0
+codetiming==1.4.0
+datasets==4.1.1
+dill==0.3.8
+wandb==0.19.11
+pytest==8.3.5
+# flash-attn 2.8.0.post2 must be built/installed for your CUDA + torch 2.7 ABI.
+# These pins capture the existing environment, not a portable CUDA lockfile.

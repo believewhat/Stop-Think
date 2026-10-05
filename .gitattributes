@@ -1,1 +1,4 @@
 *.joblib binary
+
+# Portable Linux training examples and runtime source.
+training/medqa/** text eol=lf

@@ -194,6 +194,12 @@ AGENTS.md
 # Results
 *.csv
 
+# Local training artifacts (examples use user-selected external paths)
+/training/medqa/outputs/
+/training/medqa/runtime_build/
+/training/medqa/data/
+/training/medqa/checkpoints/
+
 # Python pickle files
 *.pkl
 

@@ -1,5 +1,10 @@
 # Qwen3-30B-A3B ESTAR-Lite
 
+For current MedQA policy training, see the separate
+[SFT and DAPO examples](../training/medqa/README.md). The results below retain
+this historical math release's **THINK-only** length metric; the updated
+[manuscript tables](../README.md#paper-reported-main-results) use output tokens.
+
 This directory is the portable release of the latest Qwen3-30B-A3B (MoE)
 math pipeline run on the Gamma server on 2026-09-07/08. It replaces the older
 single-probe classifier with a probe every 50 THINK tokens and a 22-feature
